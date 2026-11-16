@@ -1,0 +1,10 @@
+[
+  {
+    "id": "qq",
+    "name": "QQ 邮箱",
+    "host": "imap.qq.com",
+    "port": 993,
+    "username": "your_address@qq.com",
+    "password_env": "QQ_MAIL_AUTH_CODE"
+  }
+]

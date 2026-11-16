@@ -1,0 +1,12 @@
+# SDK minimal otherwise grants unrestricted shell access and uploads session log events.
+- id: persistent-bash
+  disabled: true
+- id: persistent-pwsh
+  disabled: true
+- id: tool-working-directory
+  disabled: true
+- id: tool-fs
+  disabled: true
+- id: session-log-deepseek
+  config:
+    enabled: false

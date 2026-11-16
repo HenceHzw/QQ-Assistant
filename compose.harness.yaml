@@ -1,0 +1,29 @@
+services:
+  assistant:
+    image: hence-agent-assistant:harness
+    environment:
+      HARNESS_URL: http://harness:8080/turn
+      HARNESS_AUTH_TOKEN: ${HARNESS_AUTH_TOKEN:?Set HARNESS_AUTH_TOKEN in .env}
+  harness:
+    build:
+      context: .
+      dockerfile: Dockerfile.harness
+    image: hence-agent-harness:latest
+    restart: unless-stopped
+    environment:
+      DEEPSEEK_API_KEY: ${LLM_API_KEY:?Set LLM_API_KEY in .env}
+      DSH_MODEL: ${LLM_MODEL:-deepseek-flash}
+      TMPDIR: /data
+      HOME: /data
+      XDG_CACHE_HOME: /data/.cache
+      NARB_NATIVE_CACHE_DIR: /data/native-cache
+      HARNESS_AUTH_TOKEN: ${HARNESS_AUTH_TOKEN:?Set HARNESS_AUTH_TOKEN in .env}
+    volumes:
+      - ./data/harness:/data
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true

@@ -1,0 +1,15 @@
+.env
+.env.*
+data/
+config/
+tests/
+.venv/
+__pycache__/
+*.db
+*.sqlite*
+*.pem
+*.key
+*.tar
+*.tar.gz
+*.tgz
+*.zip
