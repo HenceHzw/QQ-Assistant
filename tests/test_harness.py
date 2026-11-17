@@ -17,15 +17,15 @@ except ImportError:
 
 from hence.app import App
 from hence.config import Settings
-from hence.harness import ask_harness, validated_reminder
-from hence.reminders import ZONE
+from hence.harness import ask_harness
+from hence.reminders import ZONE, validate_reminder
 from hence.store import Store
 
 
 class HarnessActionTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.store = Store(':memory:')
-        settings = Settings(123, 'ws://localhost', 'onebot', ':memory:', (), '', '', '', 120,
+        settings = Settings(123, 'ws://localhost', 'onebot', ':memory:', (), 120,
                             'http://harness:8080/turn', 'shared')
         self.app = App(settings, self.store)
         async def run_mocked_call(func, *args, **kwargs):
@@ -37,6 +37,21 @@ class HarnessActionTests(unittest.IsolatedAsyncioTestCase):
     def event(self, text, message_id):
         return {'message_type':'private', 'user_id':123, 'self_id':456, 'message_id':message_id,
                 'message':[{'type':'text','data':{'text':text}}]}
+
+    async def confirm(self, message_id):
+        preview = self.store.db.execute("SELECT * FROM outbox WHERE kind='confirm_preview' AND sent IS NULL ORDER BY id DESC").fetchone()
+        self.store.mark_sent(preview, int(datetime.now().timestamp()))
+        with patch('hence.app.ask_harness', return_value={'action': 'confirm'}):
+            await self.app.handle_event(self.event('确认', message_id))
+
+    def deliver_list(self, kind='task_list'):
+        row = self.store.db.execute('SELECT * FROM outbox WHERE kind=? AND sent IS NULL ORDER BY id DESC', (kind,)).fetchone()
+        self.assertIsNotNone(row)
+        self.store.mark_sent(row, int(datetime.now().timestamp()))
+
+    async def cancel_via_model(self, number, message_id):
+        with patch('hence.app.ask_harness', return_value={'action': 'cancel', 'ids': [number]}):
+            await self.app.handle_event(self.event('取消那项', message_id))
 
     async def test_chat_and_create_are_saved_once(self):
         result = {'action':'chat','reply':'你好，我会记住你喜欢蓝色。'}
@@ -57,7 +72,325 @@ class HarnessActionTests(unittest.IsolatedAsyncioTestCase):
         with patch('hence.app.ask_harness', return_value={'action':'complete','id':99}) as ask:
             await self.app.handle_event(self.event('我完成了那件事', 1))
             ask.assert_called_once()
-        self.assertIn('找不到', self.store.pending_outbox()['text'])
+        self.assertIn('无法确定', self.store.pending_outbox()['text'])
+
+    async def test_named_cancellation_needs_confirmation_but_no_prior_list(self):
+        with self.store.db:
+            self.store.new_reminder('体测', 2000000000)
+        with patch('hence.app.ask_harness', return_value={'action': 'cancel', 'ids': [1], 'reference': 'description'}):
+            await self.app.handle_event(self.event('取消体测', 1))
+        self.assertEqual(len(self.store.active_reminders()), 1)
+        preview = self.store.pending_outbox()
+        self.assertEqual(preview['kind'], 'confirm_preview')
+        self.assertIn('体测', preview['text'])
+        await self.confirm(2)
+        self.assertEqual(self.store.active_reminders(), [])
+
+    async def test_named_batch_keeps_targets_when_unrelated_task_changes_positions(self):
+        with self.store.db:
+            self.store.new_reminder('数学作业', 2000000000)
+            self.store.new_reminder('英语作业', 2000000100)
+        def model(*args):
+            with self.store.db:
+                self.store.new_reminder('体测', 1999999900)
+            return {'action': 'complete', 'ids': [1, 2], 'reference': 'description'}
+        with patch('hence.app.ask_harness', side_effect=model):
+            await self.app.handle_event(self.event('数学和英语作业都做完了', 1))
+        pending = self.store.db.execute('SELECT targets FROM pending_confirmation').fetchone()
+        self.assertEqual([row['title'] for row in json.loads(pending['targets'])], ['数学作业', '英语作业'])
+        await self.confirm(2)
+        self.assertEqual([row['title'] for row in self.store.active_reminders()], ['体测'])
+
+    async def test_named_batch_rejected_if_target_changes_during_model_call(self):
+        with self.store.db:
+            self.store.new_reminder('数学作业', 2000000000)
+            rid = self.store.new_reminder('英语作业', 2000000100)
+        def model(*args):
+            with self.store.db:
+                self.store.finish_reminder(rid, 'completed')
+            return {'action': 'cancel', 'ids': [1, 2], 'reference': 'description'}
+        with patch('hence.app.ask_harness', side_effect=model):
+            await self.app.handle_event(self.event('取消数学和英语作业', 1))
+        self.assertEqual([row['title'] for row in self.store.active_reminders()], ['数学作业'])
+        self.assertIn('相关事项已变化', self.store.pending_outbox()['text'])
+        self.assertIsNone(self.store.db.execute('SELECT * FROM pending_confirmation').fetchone())
+
+    async def test_position_reference_still_requires_delivered_list(self):
+        with self.store.db:
+            self.store.new_reminder('体测', 2000000000)
+        with patch('hence.app.ask_harness', return_value={'action': 'cancel', 'ids': [1], 'reference': 'position'}):
+            await self.app.handle_event(self.event('取消第一个', 1))
+        self.assertIn('先发送 /list', self.store.pending_outbox()['text'])
+        self.assertIsNone(self.store.db.execute('SELECT * FROM pending_confirmation').fetchone())
+
+    async def test_unknown_reference_mode_is_rejected(self):
+        with self.store.db:
+            self.store.new_reminder('体测', 2000000000)
+        with patch('hence.app.ask_harness', return_value={'action': 'cancel', 'ids': [1], 'reference': 'unknown'}):
+            await self.app.handle_event(self.event('取消体测', 1))
+        self.assertEqual(len(self.store.active_reminders()), 1)
+        self.assertIn('无法确定', self.store.pending_outbox()['text'])
+        self.assertIsNone(self.store.db.execute('SELECT * FROM pending_confirmation').fetchone())
+
+    async def test_batch_cancel_and_dynamic_numbering(self):
+        with self.store.db:
+            first = self.store.new_reminder('上课', 2000000100)
+            second = self.store.new_reminder('作业', 2000000000)
+        await self.app.handle_event(self.event('/list', 1))
+        self.assertIn('1. 作业', self.store.pending_outbox()['text'])
+        self.deliver_list()
+        with patch('hence.app.ask_harness', return_value={'action': 'cancel', 'ids': [1, 2]}):
+            await self.app.handle_event(self.event('取消这两个待办', 2))
+        self.assertEqual(len(self.store.active_reminders()), 2)
+        response = self.store.db.execute('SELECT text FROM outbox ORDER BY id DESC').fetchone()['text']
+        self.assertIn('请核对将要取消的 2 项', response)
+        self.assertIn('1. 作业', response)
+        self.assertIn('2. 上课', response)
+        await self.confirm(4)
+        self.assertEqual(self.store.active_reminders(), [])
+        with self.store.db:
+            self.store.new_reminder('吃饭', 2000000200)
+        await self.app.handle_event(self.event('/list', 3))
+        response = self.store.db.execute('SELECT text FROM outbox ORDER BY id DESC').fetchone()['text']
+        self.assertIn('1. 吃饭', response)
+
+    async def test_stale_list_prevents_wrong_cancellation(self):
+        with self.store.db:
+            first = self.store.new_reminder('上课', 2000000100)
+        await self.app.handle_event(self.event('/list', 1))
+        self.deliver_list()
+        with self.store.db:
+            self.store.new_reminder('作业', 2000000000)
+        await self.app.handle_event(self.event('/cancel 1', 2))
+        self.assertEqual(len(self.store.active_reminders()), 2)
+        response = self.store.db.execute('SELECT text FROM outbox ORDER BY id DESC').fetchone()['text']
+        self.assertIn('先发送 /list', response)
+
+    async def test_fixed_command_requires_delivered_list_then_executes_directly(self):
+        with self.store.db:
+            self.store.new_reminder('上课', 2000000100)
+        await self.app.handle_event(self.event('/list', 1))
+        await self.app.handle_event(self.event('/cancel 1', 2))
+        self.assertEqual(len(self.store.active_reminders()), 1)
+        self.deliver_list()
+        await self.app.handle_event(self.event('/cancel 1', 3))
+        self.assertEqual(self.store.active_reminders(), [])
+        self.assertIn('已取消待办：上课', self.store.db.execute('SELECT text FROM outbox ORDER BY id DESC').fetchone()['text'])
+        self.assertIsNone(self.store.db.execute('SELECT * FROM pending_confirmation').fetchone())
+
+    async def test_old_inflight_list_ack_does_not_authorize_changed_list(self):
+        with self.store.db:
+            self.store.new_reminder('上课', 2000000100)
+        await self.app.handle_event(self.event('/list', 1))
+        old = self.store.db.execute("SELECT * FROM outbox WHERE kind='task_list'").fetchone()
+        with self.store.db:
+            self.store.new_reminder('体测', 2000000000)
+        await self.app.handle_event(self.event('/list', 2))
+        now = int(datetime.now().timestamp())
+        self.store.mark_sent(old, now)
+        await self.app.handle_event(self.event('/cancel 1', 3))
+        self.assertEqual(len(self.store.active_reminders()), 2)
+        self.assertIn('先发送 /list', self.store.db.execute('SELECT text FROM outbox ORDER BY id DESC').fetchone()['text'])
+        self.deliver_list()
+        await self.app.handle_event(self.event('/cancel 1', 4))
+        self.assertEqual([row['title'] for row in self.store.active_reminders()], ['上课'])
+
+    async def test_old_list_retry_is_suppressed_after_new_list(self):
+        with self.store.db:
+            self.store.new_reminder('上课', 2000000100)
+        await self.app.handle_event(self.event('/list', 1))
+        now = int(datetime.now().timestamp())
+        old = self.store.pending_outbox(now)
+        self.store.defer_message(old, now)
+        with self.store.db:
+            self.store.new_reminder('体测', 2000000000)
+        await self.app.handle_event(self.event('/list', 2))
+        new = self.store.pending_outbox(now)
+        self.assertIn('1. 体测', new['text'])
+        self.store.mark_sent(new, now)
+        self.assertIsNone(self.store.pending_outbox(now + 20))
+        await self.app.handle_event(self.event('/cancel 1', 3))
+        reply = self.store.db.execute('SELECT text FROM outbox ORDER BY id DESC').fetchone()['text']
+        self.assertIn('已取消待办：体测', reply)
+        self.assertEqual([r['title'] for r in self.store.active_reminders()], ['上课'])
+
+    async def test_incomplete_model_batch_is_visible_before_any_action(self):
+        with self.store.db:
+            self.store.new_reminder('上课', 2000000000)
+            self.store.new_reminder('体测', 2000000100)
+        await self.app.handle_event(self.event('/list', 1))
+        self.deliver_list()
+        with patch('hence.app.ask_harness', return_value={'action': 'cancel', 'ids': [1]}):
+            await self.app.handle_event(self.event('取消这两项', 2))
+        preview = self.store.db.execute('SELECT text FROM outbox ORDER BY id DESC').fetchone()['text']
+        self.assertIn('1 项', preview)
+        self.assertIn('上课', preview)
+        self.assertNotIn('体测', preview)
+        self.assertEqual(len(self.store.active_reminders()), 2)
+
+    async def test_natural_confirmation_and_discard(self):
+        with self.store.db:
+            self.store.new_reminder('上课', 2000000000)
+            self.store.new_reminder('体测', 2000000100)
+        await self.app.handle_event(self.event('/list', 1))
+        self.deliver_list()
+        await self.cancel_via_model(1, 2)
+        preview = self.store.db.execute("SELECT * FROM outbox WHERE kind='confirm_preview' ORDER BY id DESC").fetchone()
+        self.store.mark_sent(preview, int(datetime.now().timestamp()))
+        with patch('hence.app.ask_harness', return_value={'action': 'discard_confirmation'}) as ask:
+            await self.app.handle_event(self.event('算了，先别取消', 3))
+        self.assertEqual(len(self.store.active_reminders()), 2)
+        self.assertEqual(ask.call_args.args[6]['targets'][0]['title'], '上课')
+        self.assertNotIn('token', ask.call_args.args[6])
+        await self.cancel_via_model(1, 4)
+        preview = self.store.db.execute("SELECT * FROM outbox WHERE kind='confirm_preview' AND sent IS NULL ORDER BY id DESC").fetchone()
+        self.store.mark_sent(preview, int(datetime.now().timestamp()))
+        with patch('hence.app.ask_harness', return_value={'action': 'confirm'}):
+            await self.app.handle_event(self.event('是的，取消吧', 5))
+        self.assertEqual([row['title'] for row in self.store.active_reminders()], ['体测'])
+
+    async def test_no_preview_or_undelivered_preview_cannot_be_confirmed(self):
+        with self.store.db:
+            self.store.new_reminder('上课', 2000000000)
+        with patch('hence.app.ask_harness', return_value={'action': 'confirm'}):
+            await self.app.handle_event(self.event('确认', 1))
+        self.assertEqual(len(self.store.active_reminders()), 1)
+        await self.app.handle_event(self.event('/list', 2))
+        self.deliver_list()
+        await self.cancel_via_model(1, 3)
+        with patch('hence.app.ask_harness', return_value={'action': 'confirm'}):
+            await self.app.handle_event(self.event('确认', 4))
+        self.assertEqual(len(self.store.active_reminders()), 1)
+        self.assertIn('没有已送达', self.store.db.execute('SELECT text FROM outbox ORDER BY id DESC').fetchone()['text'])
+        await self.confirm(5)
+        self.assertEqual(self.store.active_reminders(), [])
+
+    async def test_confirmation_is_bound_to_snapshot_during_model_call(self):
+        with self.store.db:
+            self.store.new_reminder('上课', 2000000000)
+            self.store.new_reminder('体测', 2000000100)
+        await self.app.handle_event(self.event('/list', 1))
+        self.deliver_list()
+        await self.cancel_via_model(1, 2)
+        old = self.store.db.execute("SELECT * FROM outbox WHERE kind='confirm_preview' AND sent IS NULL").fetchone()
+        self.store.mark_sent(old, int(datetime.now().timestamp()))
+        async def change_during_model(*args, **kwargs):
+            with self.store.db:
+                self.app.prepare_confirmation('cancelled', [self.store.active_reminders()[1]])
+            new = self.store.db.execute("SELECT * FROM outbox WHERE kind='confirm_preview' AND sent IS NULL").fetchone()
+            self.store.mark_sent(new, int(datetime.now().timestamp()))
+            return {'action': 'confirm'}
+        with patch('hence.app.asyncio.to_thread', side_effect=change_during_model):
+            await self.app.handle_event(self.event('确认', 3))
+        self.assertEqual(len(self.store.active_reminders()), 2)
+        self.assertIn('已变化', self.store.db.execute('SELECT text FROM outbox ORDER BY id DESC').fetchone()['text'])
+
+    async def test_model_failure_offers_fixed_command_and_invalidates_preview(self):
+        with self.store.db:
+            self.store.new_reminder('上课', 2000000000)
+        await self.app.handle_event(self.event('/list', 1))
+        self.deliver_list()
+        await self.cancel_via_model(1, 2)
+        preview = self.store.db.execute("SELECT * FROM outbox WHERE kind='confirm_preview' AND sent IS NULL").fetchone()
+        self.store.mark_sent(preview, int(datetime.now().timestamp()))
+        with patch('hence.app.ask_harness', side_effect=TimeoutError()):
+            await self.app.handle_event(self.event('确认', 3))
+        self.assertIn('/list', self.store.db.execute('SELECT text FROM outbox ORDER BY id DESC').fetchone()['text'])
+        self.assertEqual(len(self.store.active_reminders()), 1)
+        await self.app.handle_event(self.event('/cancel 1', 4))
+        self.assertEqual(self.store.active_reminders(), [])
+        self.assertIsNone(self.store.confirmation_snapshot())
+        with patch('hence.app.ask_harness', return_value={'action': 'confirm'}):
+            await self.app.handle_event(self.event('确认', 5))
+        self.assertIn('没有已送达', self.store.db.execute('SELECT text FROM outbox ORDER BY id DESC').fetchone()['text'])
+
+    async def test_fixed_command_invalidates_unsent_natural_preview(self):
+        with self.store.db:
+            self.store.new_reminder('上课', 2000000000)
+            self.store.new_reminder('体测', 2000000100)
+        await self.app.handle_event(self.event('/list', 1))
+        self.deliver_list()
+        await self.cancel_via_model(1, 2)
+        preview = self.store.db.execute("SELECT * FROM outbox WHERE kind='confirm_preview' AND sent IS NULL").fetchone()
+        self.assertIsNotNone(preview)
+        await self.app.handle_event(self.event('/cancel 2', 3))
+        self.assertEqual([row['title'] for row in self.store.active_reminders()], ['上课'])
+        self.assertIsNone(self.store.db.execute("SELECT * FROM outbox WHERE kind='confirm_preview' AND sent IS NULL").fetchone())
+        # A preview already in flight can still be acknowledged, but must not be actionable.
+        self.store.mark_sent(preview, int(datetime.now().timestamp()))
+        with patch('hence.app.ask_harness', return_value={'action': 'confirm'}):
+            await self.app.handle_event(self.event('确认', 4))
+        self.assertEqual([row['title'] for row in self.store.active_reminders()], ['上课'])
+
+    async def test_replaced_confirmation_and_changed_target_do_not_execute(self):
+        with self.store.db:
+            first = self.store.new_reminder('上课', 2000000000)
+            self.store.new_reminder('体测', 2000000100)
+        await self.app.handle_event(self.event('/list', 1))
+        self.deliver_list()
+        await self.cancel_via_model(1, 2)
+        old = self.store.db.execute("SELECT * FROM outbox WHERE kind='confirm_preview' ORDER BY id DESC").fetchone()
+        await self.cancel_via_model(2, 3)
+        new = self.store.db.execute('SELECT token FROM pending_confirmation').fetchone()['token']
+        new_preview = self.store.db.execute("SELECT * FROM outbox WHERE kind='confirm_preview' AND ref=?", (new,)).fetchone()
+        now = int(datetime.now().timestamp())
+        self.store.mark_sent(new_preview, now)
+        self.store.mark_sent(old, now)
+        with patch('hence.app.ask_harness', return_value={'action': 'confirm'}):
+            await self.app.handle_event(self.event('确认', 4))
+        self.assertEqual(len(self.store.active_reminders()), 2)
+        self.assertEqual(self.store.db.execute('SELECT token FROM pending_confirmation').fetchone()['token'], new)
+        self.store.mark_sent(new_preview, now)
+        with self.store.db:
+            self.store.db.execute("UPDATE reminders SET title='其他' WHERE id=?", (2,))
+        with patch('hence.app.ask_harness', return_value={'action': 'confirm'}):
+            await self.app.handle_event(self.event('确认', 5))
+        self.assertEqual(len(self.store.active_reminders()), 2)
+        self.assertIn('未执行', self.store.db.execute('SELECT text FROM outbox ORDER BY id DESC').fetchone()['text'])
+
+    async def test_expired_confirmation_and_unknown_truncated_id_are_rejected(self):
+        with self.store.db:
+            self.store.new_reminder('上课', 2000000000)
+            self.store.new_reminder('体测', 2000000100)
+        await self.app.handle_event(self.event('/list', 1))
+        self.deliver_list()
+        await self.cancel_via_model(1, 2)
+        preview = self.store.db.execute("SELECT * FROM outbox WHERE kind='confirm_preview'").fetchone()
+        self.store.mark_sent(preview, int(datetime.now().timestamp()))
+        with self.store.db:
+            self.store.db.execute('UPDATE pending_confirmation SET expires=0')
+        with patch('hence.app.ask_harness', return_value={'action': 'confirm'}):
+            await self.app.handle_event(self.event('确认', 3))
+        self.assertIn('没有已送达', self.store.db.execute('SELECT text FROM outbox ORDER BY id DESC').fetchone()['text'])
+        with patch('hence.app.ask_harness', return_value={'action': 'cancel', 'ids': [2], '_tasks_sent': 1}):
+            await self.app.handle_event(self.event('取消体测', 4))
+        self.assertEqual(len(self.store.active_reminders()), 2)
+        self.assertIsNone(self.store.confirmation_snapshot())
+
+    async def test_batch_is_atomic_when_list_changes_during_model_call(self):
+        with self.store.db:
+            self.store.new_reminder('上课', 2000000000)
+            second = self.store.new_reminder('作业', 2000000100)
+        await self.app.handle_event(self.event('/list', 1))
+        self.deliver_list()
+        def model(*args):
+            with self.store.db:
+                self.store.finish_reminder(second, 'completed')
+            return {'action': 'cancel', 'ids': [1, 2]}
+        with patch('hence.app.ask_harness', side_effect=model):
+            await self.app.handle_event(self.event('取消这两个', 2))
+        self.assertEqual([row['title'] for row in self.store.active_reminders()], ['上课'])
+        response = self.store.db.execute('SELECT text FROM outbox ORDER BY id DESC').fetchone()['text']
+        self.assertIn('先发送 /list', response)
+
+    async def test_invalid_batch_never_changes_tasks(self):
+        with self.store.db:
+            self.store.new_reminder('上课', 2000000000)
+        await self.app.handle_event(self.event('/list', 1))
+        for number, ids in enumerate(([1, 1], [1, True], [1, 2]), 2):
+            with patch('hence.app.ask_harness', return_value={'action': 'cancel', 'ids': ids}):
+                await self.app.handle_event(self.event('取消待办', number))
+            self.assertEqual(len(self.store.active_reminders()), 1)
 
     async def test_model_error_never_creates_a_reminder(self):
         with patch('hence.app.ask_harness', side_effect=TimeoutError()):
@@ -129,6 +462,8 @@ class HarnessActionTests(unittest.IsolatedAsyncioTestCase):
             await self.app.handle_event(self.event('/unknown', 5))
             await self.app.handle_event(self.event('/reset', 7))
             self.assertEqual(len(self.store.active_reminders()), 1)
+            await self.app.handle_event(self.event('/list', 8))
+            self.deliver_list()
             await self.app.handle_event(self.event('/complete 1', 6))
             self.assertEqual(self.store.active_reminders(), [])
             ask.assert_not_called()
@@ -145,7 +480,7 @@ class HarnessActionTests(unittest.IsolatedAsyncioTestCase):
         now = datetime(2026,11,15,20,0,tzinfo=ZONE)
         for due in ('2026-11-15T09:00:00+08:00', '2027-01-01T09:00:00', '2027-01-01T09:00:00Z'):
             with self.subTest(due=due), self.assertRaises(ValueError):
-                validated_reminder({'title':'事项','due':due}, now)
+                validate_reminder('事项', due, now)
 
 
 class HarnessPayloadTests(unittest.TestCase):
@@ -157,6 +492,33 @@ class HarnessPayloadTests(unittest.TestCase):
         self.assertIn('/help', payload['commands'])
         self.assertIn('不能直接访问邮箱', payload['capabilities'])
         self.assertEqual(payload['tasks_total'], 0)
+
+    def test_model_sees_list_positions_not_database_ids(self):
+        store = Store(':memory:')
+        with store.db:
+            first = store.new_reminder('已取消', 2000000000)
+            store.finish_reminder(first, 'cancelled')
+            store.new_reminder('上课', 2000000100)
+            store.new_reminder('作业', 2000000000)
+        with patch('hence.harness.urllib.request.urlopen', return_value=io.BytesIO(b'{"action":"list"}')) as urlopen:
+            ask_harness('http://harness/turn', 'token', '待办', datetime.now(ZONE), store.active_reminders())
+        payload = json.loads(urlopen.call_args.args[0].data)
+        self.assertEqual([(task['id'], task['title']) for task in payload['tasks']], [(1, '作业'), (2, '上课')])
+
+    def test_large_payload_is_bounded_and_model_cannot_spoof_snapshot_counts(self):
+        now = datetime.now(ZONE)
+        timestamp = int(now.timestamp())
+        task = {'id': 1, 'title': '测' * 300, 'due': timestamp + 1000000, 'status': 'pending', 'kind': 'task'}
+        date = {**task, 'kind': 'date', 'visible_from': timestamp,
+                'alerts': [timestamp + 86400 * index for index in range(1, 21)]}
+        with patch('hence.harness.urllib.request.urlopen', return_value=io.BytesIO(b'{"action":"list","_dates_sent":30}')) as urlopen:
+            result = ask_harness('http://harness/turn', 'token', '查看', now, [task] * 30, [date] * 30)
+        raw = urlopen.call_args.args[0].data
+        payload = json.loads(raw)
+        self.assertLessEqual(len(raw), 60000)
+        self.assertEqual(payload['dates_total'], 30)
+        self.assertLess(len(payload['dates']), 30)
+        self.assertEqual(result['_dates_sent'], len(payload['dates']))
 
 
 class RealHarnessTests(unittest.TestCase):

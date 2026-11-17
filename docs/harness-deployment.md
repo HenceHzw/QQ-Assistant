@@ -40,7 +40,7 @@ docker save hence-agent-assistant:harness hence-agent-harness:latest \
 
 tar -czf /tmp/qq-assistant-source.tar.gz \
   hence/*.py harness_runtime/server.py harness_runtime/profile.yml \
-  config/mailboxes.example.json README.md docs/harness-deployment.md \
+  config/mailboxes.example.json README.md docs/harness-deployment.md docs/date-reminders.md \
   .env.example .gitignore .dockerignore compose.yaml compose.harness.yaml \
   Dockerfile Dockerfile.harness requirements.txt LICENSE THIRD-PARTY-NOTICES.md
 ```
@@ -79,6 +79,8 @@ docker compose -f compose.yaml -f compose.harness.yaml ps
 
 以下操作在**服务器现有项目目录**执行。保留原目录与 Compose 项目名：改变它们可能让 Compose 将服务识别为新项目。不要覆盖服务器的 `.env`、`config/mailboxes.json`、`data/` 或已调整的 Compose 配置。
 
+当前版本的自然语言功能统一使用 Harness，旧的 `LLM_URL` 配置不再使用。已经启用 Harness 的部署无需调整 API 配置；更新时请同时更新助手和 Harness 镜像。
+
 1. 准备新版本镜像。例如，在电脑项目目录构建并上传（`update-1` 是示例标签，每次更新应使用尚未使用的新标签）：
 
    ```bash
@@ -91,6 +93,8 @@ docker compose -f compose.yaml -f compose.harness.yaml ps
 
    将服务器用户名和地址替换为实际值。已安装的新旧镜像使用不同标签，便于回退。
 2. 更新前停止助手和 Harness，再备份配置与数据。下例假设这些文件和目录均已存在；备份文件含私人信息，应妥善保护：
+
+   日期提醒版本会升级待办数据库。旧版程序不认识日期提醒，不能直接接管升级后的数据库；需要回退时，应先停止服务并恢复升级前的数据库备份。恢复备份会丢失备份之后产生的数据，请先妥善保留当前数据。
 
    ```bash
    docker compose -f compose.yaml -f compose.harness.yaml stop assistant harness
@@ -119,7 +123,7 @@ docker compose -f compose.yaml -f compose.harness.yaml ps
    docker compose -f compose.yaml -f compose.harness.yaml logs --tail=50 assistant harness
    ```
 
-如果更新失败，可根据备份恢复之前的 Compose 配置，并确认旧镜像仍存在，再用相同的启动命令恢复。启动后用 `/help`、`/list` 和测试邮件验证；如需验证新邮箱，先等待首次同步完成。
+如果更新失败并需要回退到不支持日期提醒的旧版，先停止助手和 Harness，妥善保留当前数据，再从升级前的备份恢复 `data/assistant` 和 Compose 配置，确认旧镜像仍存在后启动。恢复备份会丢失备份之后的数据。启动后用 `/help`、`/list` 和测试邮件验证；如需验证新邮箱，先等待首次同步完成。
 
 ## 检查状态
 
@@ -139,4 +143,4 @@ docker compose -f compose.yaml -f compose.harness.yaml logs --tail=50 assistant 
 
 `.env` 包含凭据，`config/mailboxes.json` 包含邮箱地址；`data/assistant` 保存待办和邮箱同步状态，`data/harness` 保存会话，`data/qq` 与 `data/napcat-*` 保存 QQ 登录或配置数据。备份应限制访问权限，不要公开这些内容。
 
-邮箱流程不会将邮件正文发送给模型；用户主动发送的私聊文本、会话上下文和待办快照会发送给模型服务。Harness 未启用模型可用的文件系统和 shell 工具。
+邮箱流程不会将邮件正文发送给模型；用户主动发送的私聊文本、会话上下文、当前待办和未完成日期提醒快照会发送给模型服务。Harness 未启用模型可用的文件系统和 shell 工具。

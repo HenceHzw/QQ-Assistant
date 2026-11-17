@@ -25,6 +25,33 @@ from hence.store import Store
 
 
 class StoreTests(unittest.TestCase):
+    def test_upgrade_discards_unconfirmed_legacy_views_and_delayed_lists(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, 'db')
+            db = sqlite3.connect(path)
+            db.executescript('''
+                CREATE TABLE task_view (id INTEGER PRIMARY KEY, ids TEXT NOT NULL);
+                INSERT INTO task_view VALUES (1, '[1]');
+                CREATE TABLE outbox (id INTEGER PRIMARY KEY, kind TEXT NOT NULL, ref TEXT NOT NULL,
+                    text TEXT NOT NULL, created INTEGER NOT NULL, sent INTEGER, UNIQUE(kind,ref));
+                INSERT INTO outbox(kind,ref,text,created) VALUES ('reply','old-list','当前待办：旧列表',1);
+                INSERT INTO outbox(kind,ref,text,created) VALUES ('reply','other','其他回复',2);
+            ''')
+            db.commit()
+            db.close()
+            store = Store(path)
+            self.assertIsNone(store.db.execute('SELECT * FROM task_view').fetchone())
+            self.assertEqual(store.pending_outbox()['text'], '其他回复')
+            with store.db:
+                store.new_reminder('新任务', 2000000000)
+                store.enqueue_list('task_list', 'new-list', store.active_reminders(), '新列表')
+            row = store.db.execute("SELECT * FROM outbox WHERE kind='task_list'").fetchone()
+            store.mark_sent(row, 100)
+            store.db.close()
+            store = Store(path)
+            self.assertTrue(store.task_view_matches(store.active_reminders()))
+            store.db.close()
+
     def test_legacy_database_migrates_without_losing_data(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, 'db')
@@ -88,6 +115,61 @@ class StoreTests(unittest.TestCase):
             store.finish_reminder(rid, 'cancelled')
         self.assertIsNone(store.pending_outbox())
 
+    def test_cancel_during_send_preserves_new_reply_for_ack_and_retry(self):
+        for kind in ('task', 'date'):
+            for success in (True, False):
+                with self.subTest(kind=kind, success=success):
+                    store = Store(':memory:')
+                    self.addCleanup(store.db.close)
+                    with store.db:
+                        rid = (store.new_reminder('体测', 100) if kind == 'task' else
+                               store.new_date_reminder('体测', 200, 0, 300, [100, 110]))
+                    store.schedule_due(120)
+                    sending = store.pending_outbox(120)
+                    with store.db:
+                        store.finish_reminder(rid, 'cancelled')
+                        store.enqueue('reply', 'cancel-event', '已取消体测', now=121)
+                    reply = store.pending_outbox(121)
+                    self.assertNotEqual(reply['id'], sending['id'])
+                    if success:
+                        store.mark_sent(sending, 122)
+                    else:
+                        store.defer_message(sending, 122)
+                    pending = store.pending_outbox(122)
+                    self.assertEqual((pending['text'], pending['attempts'], pending['sent']), ('已取消体测', 0, None))
+                    store.mark_sent(pending, 123)
+                    store.schedule_due(400)
+                    self.assertIsNone(store.pending_outbox(400))
+                    self.assertEqual(store.db.execute('SELECT status FROM reminders WHERE id=?', (rid,)).fetchone()[0], 'cancelled')
+
+    def test_stale_receipt_does_not_modify_replacement_message(self):
+        # Simulate an old cleanup reusing row IDs: callbacks must also match
+        # message kind/ref, including every member of a merged notification.
+        for merged in (False, True):
+            for collision in ('ref', 'kind'):
+                with self.subTest(merged=merged, collision=collision):
+                    store = Store(':memory:')
+                    self.addCleanup(store.db.close)
+                    with store.db:
+                        if merged:
+                            store.new_date_reminder('体测', 200, 0, 300, [100, 110])
+                        else:
+                            store.new_reminder('体测', 100)
+                    store.schedule_due(120)
+                    sending = store.pending_outbox(120)
+                    originals = store.db.execute('SELECT * FROM outbox ORDER BY id').fetchall()
+                    with store.db:
+                        store.db.execute('DELETE FROM outbox')
+                        for row in originals:
+                            store.enqueue('reply' if collision == 'kind' else row['kind'],
+                                          row['ref'] if collision == 'kind' else 'new-' + row['ref'], '新消息', now=121)
+                    store.defer_message(sending, 122)
+                    store.mark_sent(sending, 123)
+                    replacement = store.db.execute('SELECT * FROM outbox ORDER BY id').fetchall()
+                    self.assertEqual([row['id'] for row in replacement], [row['id'] for row in originals])
+                    self.assertTrue(all(row['sent'] is None and row['attempts'] == 0 for row in replacement))
+                    self.assertEqual(store.db.execute('SELECT status FROM reminders').fetchone()[0], 'pending')
+
     def test_retry_does_not_block_other_messages_and_survives_restart(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, 'db')
@@ -114,6 +196,21 @@ class StoreTests(unittest.TestCase):
         rows = store.db.execute('SELECT text FROM outbox ORDER BY id').fetchall()
         self.assertEqual(len(rows), 2)
         self.assertIn('已恢复', rows[1]['text'])
+
+
+class SettingsTests(unittest.TestCase):
+    def test_legacy_llm_url_does_not_override_harness_or_block_startup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, 'mailboxes.json')
+            with open(path, 'w') as config:
+                config.write('[]')
+            env = {'OWNER_QQ': '123', 'ONEBOT_TOKEN': 'onebot', 'MAIL_CONFIG': path,
+                   'HARNESS_URL': 'http://harness:8080/turn', 'HARNESS_AUTH_TOKEN': 'shared',
+                   'LLM_URL': 'old-value-no-longer-used'}
+            with patch.dict(os.environ, env, clear=True):
+                settings = Settings.load()
+            self.assertEqual(settings.harness_url, 'http://harness:8080/turn')
+            self.assertEqual(settings.harness_token, 'shared')
 
 
 class FakeIMAP:
@@ -188,7 +285,7 @@ class GraphTests(unittest.TestCase):
 class AppTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.store = Store(':memory:')
-        settings = Settings(123, 'ws://localhost:3001', 'token', ':memory:', (), '', '', '', 120)
+        settings = Settings(123, 'ws://localhost:3001', 'token', ':memory:', (), 120)
         self.app = App(settings, self.store)
 
     def event(self, text, sender=123, message_id=1):
@@ -233,12 +330,40 @@ class AppTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(rows[0]['sent'])
         self.assertIsNotNone(rows[1]['sent'])
 
+    async def test_cancel_while_dispatch_waits_for_ack_delivers_cancellation_reply(self):
+        with self.store.db:
+            rid = self.store.new_reminder('体测', 100)
+        self.store.schedule_due(120)
+        started, release, replied = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        sent = []
+        async def send(_user, text):
+            sent.append(text)
+            if len(sent) == 1:
+                started.set()
+                await release.wait()
+            else:
+                replied.set()
+        self.app.bot.send = send
+        worker = asyncio.create_task(self.app.dispatch_loop())
+        try:
+            await asyncio.wait_for(started.wait(), 1)
+            with self.store.db:
+                self.store.finish_reminder(rid, 'cancelled')
+                self.store.enqueue('reply', 'cancel-event', '已取消体测')
+            release.set()
+            await asyncio.wait_for(replied.wait(), 1)
+            self.assertEqual(sent[1:], ['已取消体测'])
+        finally:
+            release.set()
+            worker.cancel()
+            await asyncio.gather(worker, return_exceptions=True)
+
 
 class OneBotTests(unittest.IsolatedAsyncioTestCase):
     async def test_send_waits_for_successful_onebot_ack(self):
         from hence.onebot import OneBot
         import json
-        settings = Settings(123, 'ws://localhost:3001', 'token', ':memory:', (), '', '', '', 120)
+        settings = Settings(123, 'ws://localhost:3001', 'token', ':memory:', (), 120)
         bot = OneBot(settings, None)
         class Socket:
             async def send(self, data):

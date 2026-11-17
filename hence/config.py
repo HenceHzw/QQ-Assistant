@@ -11,9 +11,6 @@ class Settings:
     onebot_token: str
     db_path: str
     mailboxes: tuple
-    llm_url: str
-    llm_key: str
-    llm_model: str
     poll_seconds: int
     harness_url: str = ""
     harness_token: str = ""
@@ -60,15 +57,9 @@ class Settings:
         poll = int(os.environ.get("MAIL_POLL_SECONDS", "120"))
         if poll < 30:
             raise ValueError("MAIL_POLL_SECONDS must be at least 30")
-        llm_url = os.environ.get("LLM_URL", "")
-        if llm_url and not llm_url.startswith('https://'):
-            raise ValueError("LLM_URL must use HTTPS")
-        if llm_url and (not os.environ.get("LLM_API_KEY") or not os.environ.get("LLM_MODEL")):
-            raise ValueError("LLM_URL requires LLM_API_KEY and LLM_MODEL")
         harness_url = os.environ.get('HARNESS_URL', '')
         harness_token = os.environ.get('HARNESS_AUTH_TOKEN', '')
         if harness_url and (not harness_url.startswith(('http://', 'https://')) or not harness_token):
             raise ValueError('HARNESS_URL requires a valid URL and HARNESS_AUTH_TOKEN')
         return cls(owner, url, token, os.environ.get("DB_PATH", "/data/assistant.sqlite3"), tuple(mailboxes),
-                   llm_url, os.environ.get("LLM_API_KEY", ""), os.environ.get("LLM_MODEL", ""), poll,
-                   harness_url, harness_token)
+                   poll, harness_url, harness_token)

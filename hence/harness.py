@@ -1,28 +1,40 @@
 import json
 import urllib.request
-from datetime import datetime, timedelta
+from datetime import datetime
 from .commands import CAPABILITIES, HELP
 
 
-def ask_harness(url, token, text, now, tasks):
+def ask_harness(url, token, text, now, tasks, dates=(), pending_confirmation=None):
     payload = {'text': text, 'now': now.isoformat(), 'commands': HELP, 'capabilities': CAPABILITIES,
-               'tasks_total': len(tasks), 'tasks': [
-        {'id': row['id'], 'title': row['title'], 'due': datetime.fromtimestamp(row['due'], now.tzinfo).isoformat(),
-         'status': row['status']} for row in tasks[:30]]}
-    request = urllib.request.Request(url, data=json.dumps(payload, ensure_ascii=False).encode(),
+               'tasks_total': len(tasks), 'tasks': [], 'dates_total': len(dates), 'dates': [],
+               'pending_confirmation': pending_confirmation}
+    def encode():
+        return json.dumps(payload, ensure_ascii=False).encode()
+    if len(encode()) > 60000:
+        raise ValueError('message exceeds Harness size budget')
+    for index, row in enumerate(tasks[:30], 1):
+        item = {'id': index, 'title': row['title'], 'due': datetime.fromtimestamp(row['due'], now.tzinfo).isoformat(),
+                'status': row['status'], 'kind': row['kind']}
+        payload['tasks'].append(item)
+        if len(encode()) > 60000:
+            payload['tasks'].pop()
+            break
+    for index, row in enumerate(dates[:30], 1):
+        row = dict(row)
+        item = {'id': index, 'title': row['title'], 'date': datetime.fromtimestamp(row['due'], now.tzinfo).strftime('%Y-%m-%d'),
+                'status': row['status'], 'show_from': datetime.fromtimestamp(row['visible_from'], now.tzinfo).strftime('%Y-%m-%d'),
+                'alerts': [datetime.fromtimestamp(ts, now.tzinfo).isoformat() for ts in row.get('alerts', [])]}
+        payload['dates'].append(item)
+        if len(encode()) > 60000:
+            payload['dates'].pop()
+            break
+    request = urllib.request.Request(url, data=encode(),
         headers={'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}, method='POST')
     with urllib.request.urlopen(request, timeout=180) as response:
         obj = json.load(response)
     if not isinstance(obj, dict):
         raise ValueError('invalid Harness response')
+    # Counts come from the local request, not the model's JSON.
+    obj['_tasks_sent'] = len(payload['tasks'])
+    obj['_dates_sent'] = len(payload['dates'])
     return obj
-
-
-def validated_reminder(obj, now):
-    title, due = obj.get('title'), obj.get('due')
-    if not isinstance(title, str) or not title.strip() or len(title) > 300 or not isinstance(due, str):
-        raise ValueError('invalid title or due')
-    due = datetime.fromisoformat(due)
-    if due.tzinfo is None or due.utcoffset() != timedelta(hours=8) or due <= now:
-        raise ValueError('invalid due time')
-    return title.strip(), int(due.timestamp())
