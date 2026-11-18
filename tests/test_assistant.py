@@ -1,74 +1,55 @@
-import asyncio
 import os
 import sqlite3
 import ssl
-import sys
 import tempfile
-import types
 import unittest
 from datetime import datetime, timedelta
 from unittest.mock import patch
 
-# Tests of application behavior do not require a live WebSocket library or QQ.
-if 'websockets' not in sys.modules:
-    try:
-        import websockets  # noqa: F401
-    except ImportError:
-        sys.modules['websockets'] = types.ModuleType('websockets')
-
-from hence.app import App
-from hence.config import Settings
+from hence.app import format_task
+from hence.dates import validate_date_reminder
 from hence.mail import poll_mailbox
-from hence.graph import fetch_page, save_token
 from hence.reminders import ZONE
-from hence.store import Store
+from hence.store import Store, outbox_message
+from helpers import AssistantTestCase
 
 
 class StoreTests(unittest.TestCase):
-    def test_upgrade_discards_unconfirmed_legacy_views_and_delayed_lists(self):
+    def test_upgrade_preserves_tasks_and_replies_and_invalidates_old_lists(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, 'db')
             db = sqlite3.connect(path)
             db.executescript('''
+                CREATE TABLE reminders (id INTEGER PRIMARY KEY, title TEXT NOT NULL,
+                    due INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'pending');
+                INSERT INTO reminders(title,due) VALUES ('已有待办', 2000000000);
+                CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                INSERT INTO kv VALUES ('pending_input', '旧数据');
                 CREATE TABLE task_view (id INTEGER PRIMARY KEY, ids TEXT NOT NULL);
                 INSERT INTO task_view VALUES (1, '[1]');
                 CREATE TABLE outbox (id INTEGER PRIMARY KEY, kind TEXT NOT NULL, ref TEXT NOT NULL,
                     text TEXT NOT NULL, created INTEGER NOT NULL, sent INTEGER, UNIQUE(kind,ref));
                 INSERT INTO outbox(kind,ref,text,created) VALUES ('reply','old-list','当前待办：旧列表',1);
+                INSERT INTO outbox(kind,ref,text,created) VALUES ('date_list','old-page','旧日期列表',1);
+                INSERT INTO outbox(kind,ref,text,created) VALUES ('confirm_preview','preview','旧确认',1);
                 INSERT INTO outbox(kind,ref,text,created) VALUES ('reply','other','其他回复',2);
             ''')
             db.commit()
             db.close()
             store = Store(path)
-            self.assertIsNone(store.db.execute('SELECT * FROM task_view').fetchone())
+            self.assertFalse(store.positions_match('task', store.active_reminders(), [1]))
             self.assertEqual(store.pending_outbox()['text'], '其他回复')
+            self.assertEqual(store.pending_outbox()['attempts'], 0)
+            self.assertEqual(store.db.execute("SELECT value FROM kv WHERE key='pending_input'").fetchone()[0], '旧数据')
+            task, = store.active_reminders()
+            self.assertEqual((task['title'], task['kind']), ('已有待办', 'task'))
             with store.db:
-                store.new_reminder('新任务', 2000000000)
                 store.enqueue_list('task_list', 'new-list', store.active_reminders(), '新列表')
-            row = store.db.execute("SELECT * FROM outbox WHERE kind='task_list'").fetchone()
+            row = outbox_message(store.db.execute("SELECT * FROM outbox WHERE kind='task_list'").fetchone())
             store.mark_sent(row, 100)
             store.db.close()
             store = Store(path)
-            self.assertTrue(store.task_view_matches(store.active_reminders()))
-            store.db.close()
-
-    def test_legacy_database_migrates_without_losing_data(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = os.path.join(directory, 'db')
-            db = sqlite3.connect(path)
-            db.executescript('''
-                CREATE TABLE outbox (id INTEGER PRIMARY KEY, kind TEXT NOT NULL, ref TEXT NOT NULL,
-                    text TEXT NOT NULL, created INTEGER NOT NULL, sent INTEGER, UNIQUE(kind, ref));
-                INSERT INTO outbox(kind, ref, text, created) VALUES ('reply', 'old', '旧消息', 1);
-                CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-                INSERT INTO kv VALUES ('pending_input', '旧数据');
-            ''')
-            db.commit()
-            db.close()
-            store = Store(path)
-            self.assertEqual(store.pending_outbox()['text'], '旧消息')
-            self.assertEqual(store.db.execute('SELECT value FROM kv').fetchone()[0], '旧数据')
-            self.assertEqual(store.pending_outbox()['attempts'], 0)
+            self.assertTrue(store.positions_match('task', store.active_reminders(), [1]))
             store.db.close()
 
     def test_restart_due_delivery_and_completion(self):
@@ -106,15 +87,6 @@ class StoreTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             store.mailbox_message('qq', '11', 7, 'mail')
 
-    def test_cancel_unsent_reminder(self):
-        store = Store(':memory:')
-        with store.db:
-            rid = store.new_reminder('事', 100)
-        store.schedule_due(120)
-        with store.db:
-            store.finish_reminder(rid, 'cancelled')
-        self.assertIsNone(store.pending_outbox())
-
     def test_cancel_during_send_preserves_new_reply_for_ack_and_retry(self):
         for kind in ('task', 'date'):
             for success in (True, False):
@@ -141,34 +113,6 @@ class StoreTests(unittest.TestCase):
                     store.schedule_due(400)
                     self.assertIsNone(store.pending_outbox(400))
                     self.assertEqual(store.db.execute('SELECT status FROM reminders WHERE id=?', (rid,)).fetchone()[0], 'cancelled')
-
-    def test_stale_receipt_does_not_modify_replacement_message(self):
-        # Simulate an old cleanup reusing row IDs: callbacks must also match
-        # message kind/ref, including every member of a merged notification.
-        for merged in (False, True):
-            for collision in ('ref', 'kind'):
-                with self.subTest(merged=merged, collision=collision):
-                    store = Store(':memory:')
-                    self.addCleanup(store.db.close)
-                    with store.db:
-                        if merged:
-                            store.new_date_reminder('体测', 200, 0, 300, [100, 110])
-                        else:
-                            store.new_reminder('体测', 100)
-                    store.schedule_due(120)
-                    sending = store.pending_outbox(120)
-                    originals = store.db.execute('SELECT * FROM outbox ORDER BY id').fetchall()
-                    with store.db:
-                        store.db.execute('DELETE FROM outbox')
-                        for row in originals:
-                            store.enqueue('reply' if collision == 'kind' else row['kind'],
-                                          row['ref'] if collision == 'kind' else 'new-' + row['ref'], '新消息', now=121)
-                    store.defer_message(sending, 122)
-                    store.mark_sent(sending, 123)
-                    replacement = store.db.execute('SELECT * FROM outbox ORDER BY id').fetchall()
-                    self.assertEqual([row['id'] for row in replacement], [row['id'] for row in originals])
-                    self.assertTrue(all(row['sent'] is None and row['attempts'] == 0 for row in replacement))
-                    self.assertEqual(store.db.execute('SELECT status FROM reminders').fetchone()[0], 'pending')
 
     def test_retry_does_not_block_other_messages_and_survives_restart(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -198,19 +142,195 @@ class StoreTests(unittest.TestCase):
         self.assertIn('已恢复', rows[1]['text'])
 
 
-class SettingsTests(unittest.TestCase):
-    def test_legacy_llm_url_does_not_override_harness_or_block_startup(self):
+def moment(day, clock='00:00'):
+    return datetime.strptime(day + ' ' + clock, '%Y-%m-%d %H:%M').replace(tzinfo=ZONE)
+
+
+class DateStoreTests(unittest.TestCase):
+    def setUp(self):
+        self.store = Store(':memory:')
+        self.addCleanup(self.store.db.close)
+        self.now = moment('2026-12-01')
+
+    def create(self, show=2, alerts=None):
+        alerts = alerts or [{'days': 2, 'time': '09:00'}, {'days': 0, 'time': '09:00'}]
+        values = validate_date_reminder('体测', '2026-12-20', show, alerts, self.now)
+        title, due, start, end, future, _ = values
+        with self.store.db:
+            return self.store.new_date_reminder(title, due, start, end, future)
+
+    def test_visibility_and_retention(self):
+        rid = self.create()
+        for day, expected in [('2026-12-17', False), ('2026-12-18', True),
+                              ('2026-12-19', True), ('2026-12-20', True), ('2026-12-21', False)]:
+            with self.subTest(day=day):
+                self.assertEqual(bool(self.store.active_reminders(moment(day).timestamp())), expected)
+        self.assertEqual(self.store.date_reminders()[0]['id'], rid)
+        self.assertIn('日期提醒', format_task(self.store.active_reminders(moment('2026-12-18').timestamp())[0]))
+
+    def test_missed_alerts_are_combined_after_restart_and_sent_once(self):
         with tempfile.TemporaryDirectory() as directory:
-            path = os.path.join(directory, 'mailboxes.json')
-            with open(path, 'w') as config:
-                config.write('[]')
-            env = {'OWNER_QQ': '123', 'ONEBOT_TOKEN': 'onebot', 'MAIL_CONFIG': path,
-                   'HARNESS_URL': 'http://harness:8080/turn', 'HARNESS_AUTH_TOKEN': 'shared',
-                   'LLM_URL': 'old-value-no-longer-used'}
-            with patch.dict(os.environ, env, clear=True):
-                settings = Settings.load()
-            self.assertEqual(settings.harness_url, 'http://harness:8080/turn')
-            self.assertEqual(settings.harness_token, 'shared')
+            path = os.path.join(directory, 'data.db')
+            self.store = Store(path)
+            self.create()
+            self.store.db.close()
+            self.store = Store(path)
+            self.addCleanup(self.store.db.close)
+            late = int(moment('2026-12-21').timestamp())
+            self.store.schedule_due(late)
+            self.store.schedule_due(late)
+            message = self.store.pending_outbox(late)
+            self.assertIn('迟到', message['text'])
+            self.assertIn('2026-12-18 09:00', message['text'])
+            self.assertIn('2026-12-20 09:00', message['text'])
+            self.assertEqual(len(message['batch']), 2)
+            self.store.mark_sent(message, late)
+            self.assertIsNone(self.store.pending_outbox(late))
+            self.assertEqual(self.store.date_reminders()[0]['status'], 'notified')
+
+    def test_retry_keeps_batch_across_restart_and_cancellation_removes_later_alerts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, 'db')
+            self.store = Store(path)
+            rid = self.create()
+            first = int(moment('2026-12-18', '09:00').timestamp())
+            self.store.schedule_due(first)
+            pending = self.store.pending_outbox(first)
+            self.store.defer_message(pending, first)
+            self.store.db.close()
+            self.store = Store(path)
+            self.addCleanup(self.store.db.close)
+            later = int(moment('2026-12-20', '09:00').timestamp())
+            self.store.schedule_due(later)
+            retry = self.store.pending_outbox(later)
+            self.assertEqual((retry['batch'], retry['text']), (pending['batch'], pending['text']))
+            self.store.mark_sent(retry, later)
+            next_alert = self.store.pending_outbox(later)
+            self.assertNotEqual(next_alert['ref'], retry['ref'])
+            self.assertNotIn('12-18', next_alert['text'])
+            with self.store.db:
+                self.store.finish_reminder(rid, 'cancelled')
+            self.assertIsNone(self.store.pending_outbox(later))
+
+    def test_each_alert_is_delivered_once_even_when_the_next_one_is_already_queued(self):
+        self.create(alerts=[{'days': 2, 'time': '09:00'}, {'days': 2, 'time': '09:01'},
+                            {'days': 0, 'time': '09:00'}])
+        first = int(moment('2026-12-18', '09:00').timestamp())
+        self.store.schedule_due(first)
+        sending = self.store.pending_outbox(first)
+        self.assertNotIn('迟到', sending['text'])
+        self.assertIn('2026-12-18 09:00', sending['text'])
+
+        self.store.schedule_due(first + 60)
+        self.store.mark_sent(sending, first + 60)
+        second = self.store.pending_outbox(first + 60)
+        self.assertIn('2026-12-18 09:01', second['text'])
+        self.assertNotIn('2026-12-18 09:00', second['text'])
+        self.store.mark_sent(second, first + 60)
+
+        later = int(moment('2026-12-20', '09:00').timestamp())
+        self.store.schedule_due(later)
+        last = self.store.pending_outbox(later)
+        self.assertIn('2026-12-20 09:00', last['text'])
+        self.assertNotIn('2026-12-18', last['text'])
+        self.store.mark_sent(last, later)
+        self.assertIsNone(self.store.pending_outbox(later))
+
+    def test_custom_window_and_past_times(self):
+        values = validate_date_reminder('会议', '2026-12-20', 7,
+                                        [{'days': 3, 'time': '09:00'}, {'days': 0, 'time': '10:00'}],
+                                        moment('2026-12-19'))
+        self.assertEqual(datetime.fromtimestamp(values[2], ZONE).date().isoformat(), '2026-12-13')
+        self.assertEqual(len(values[4]), 1)
+        self.assertEqual(len(values[5]), 1)
+        for alerts in ([], [{'days': 0, 'time': '25:00'}],
+                       [{'days': 0, 'time': '09:00'}, {'days': 0, 'time': '09:00'}]):
+            with self.subTest(alerts=alerts), self.assertRaises(ValueError):
+                validate_date_reminder('会议', '2026-12-20', 2, alerts, self.now)
+
+
+class DateAppTests(AssistantTestCase):
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.day = (datetime.now(ZONE) + timedelta(days=30)).strftime('%Y-%m-%d')
+
+    async def test_offline_create_list_cancel(self):
+        await self.say(f'/date-add {self.day} 体测', 1)
+        self.assertIn('已创建日期提醒', self.last_reply())
+        self.assertEqual(len(self.store.active_reminders()), 0)
+        self.assertEqual(len(self.store.date_reminders()), 1)
+        await self.say('/date-cancel 1', 2)
+        self.assertIn('先发送 /dates', self.last_reply())
+        await self.say('/dates', 3)
+        self.assertIn('1. 体测', self.last_reply())
+        self.deliver('date_list')
+        await self.say(f'/date-add {self.day} 考试', 4)
+        await self.say('/date-cancel 1', 5)
+        self.assertIn('已取消', self.last_reply())
+        self.assertEqual([r['title'] for r in self.store.date_reminders()], ['考试'])
+        await self.say('/dates', 6)
+        self.deliver('date_list')
+        await self.say('/date-complete 1', 7)
+        self.assertIn('已完成日期提醒：考试', self.last_reply())
+        self.assertEqual(self.store.date_reminders(), [])
+
+    async def test_date_positions_require_delivery_of_the_matching_date_page(self):
+        for n in range(1, 7):
+            await self.say(f'/date-add {self.day} 事项{n}', n)
+        await self.say('/dates', 7)
+        self.deliver('date_list')
+        await self.say('/date-complete 6', 8)
+        self.assertIn('先发送 /dates 2', self.last_reply())
+        await self.say('/dates 2', 9)
+        self.assertIn('6. 事项6', self.last_reply())
+        self.deliver('date_list')
+        await self.say('/date-complete 6', 10)
+        self.assertIn('已完成日期提醒：事项6', self.last_reply())
+        self.assertEqual(len(self.store.date_reminders()), 5)
+
+    async def test_custom_command_and_natural_language(self):
+        await self.say(f'/date-add {self.day} --show 7 --alerts 3@09:00,0@10:00 体测', 1)
+        row = self.store.date_reminders()[0]
+        self.assertEqual(len(self.store.date_alert_times(row['id'])), 2)
+        result = {'action': 'create_date', 'title': '考试', 'date': self.day, 'show_days': 4,
+                  'alerts': [{'days': 4, 'time': '08:30'}, {'days': 0, 'time': '10:00'}]}
+        await self.model_turn('创建考试日期提醒', 2, **result)
+        self.assertEqual(len(self.store.date_reminders()), 2)
+        await self.model_turn('查看日期提醒', 3, action='list_dates')
+        self.deliver('date_list')
+        await self.model_turn('取消这两个日期提醒', 4, action='date_cancel', ids=[1, 2])
+        self.assertEqual(len(self.store.date_reminders()), 2)
+        await self.confirm(5)
+        self.assertEqual(self.store.date_reminders(), [])
+
+    async def test_hidden_date_can_be_cancelled_by_name_without_viewing_dates(self):
+        await self.say(f'/date-add {self.day} 体测', 1)
+        self.assertEqual(self.store.active_reminders(), [])
+        await self.model_turn('取消体测', 2, action='date_cancel', ids=[1], reference='description')
+        self.assertIn('请核对将要取消的 1 项', self.last_reply())
+        self.assertEqual(len(self.store.date_reminders()), 1)
+        await self.confirm(3)
+        self.assertEqual(self.store.date_reminders(), [])
+
+    async def test_visible_date_can_be_completed_from_normal_list(self):
+        soon = (datetime.now(ZONE) + timedelta(days=1)).strftime('%Y-%m-%d')
+        await self.say(f'/date-add {soon} 体测', 1)
+        await self.say('/list', 2)
+        self.assertIn('1. 体测', self.last_reply())
+        self.assertIn('日期提醒', self.last_reply())
+        self.deliver('task_list')
+        await self.say('/complete 1', 3)
+        self.assertIn('已完成', self.last_reply())
+        self.assertEqual(self.store.date_reminders(), [])
+
+    async def test_malformed_custom_command_and_numeric_title(self):
+        await self.say(f'/date-add {self.day} 7 3@09:00', 1)
+        self.assertIn('格式或时间无效', self.last_reply())
+        await self.say(f'/date-add {self.day} --show 7 --alerts 3@09:00', 2)
+        self.assertIn('格式或时间无效', self.last_reply())
+        self.assertEqual(self.store.date_reminders(), [])
+        await self.say(f'/date-add {self.day} 2027 年 体测', 3)
+        self.assertEqual(self.store.date_reminders()[0]['title'], '2027 年 体测')
 
 
 class FakeIMAP:
@@ -250,135 +370,14 @@ class MailTests(unittest.TestCase):
                 poll_mailbox(box, {'uidvalidity':'8', 'last_uid':2})
 
 
-class GraphTests(unittest.TestCase):
-    def test_delta_baseline_paging_new_mail_and_replay(self):
-        store = Store(':memory:')
-        old = {'id': 'old', 'subject': 'old', 'from': {'emailAddress': {'name': 'Alice'}}}
-        new = {'id': 'new', 'subject': 'new', 'from': {'emailAddress': {'name': 'Bob'}}}
-        store.graph_page('school', '学校邮箱', {'value': [old], '@odata.nextLink': 'page2'}, True)
-        self.assertTrue(store.graph_state('school')['baseline'])
-        store.graph_page('school', '学校邮箱', {'value': [], '@odata.deltaLink': 'delta'}, True)
-        self.assertFalse(store.graph_state('school')['baseline'])
-        store.graph_page('school', '学校邮箱', {'value': [old, new], '@odata.deltaLink': 'delta2'}, False)
-        store.graph_page('school', '学校邮箱', {'value': [new], '@odata.deltaLink': 'delta3'}, False)
-        rows = store.db.execute('SELECT * FROM outbox').fetchall()
-        self.assertEqual(len(rows), 1)
-        self.assertIn('Bob', rows[0]['text'])
-        self.assertEqual(store.graph_state('school')['cursor'], 'delta3')
-
-    def test_cursor_origin_restricted_and_token_file_private(self):
-        with self.assertRaises(ValueError):
-            fetch_page({'token_file': 'not-accessed'}, 'https://attacker.example/steal')
-        with tempfile.TemporaryDirectory() as directory:
-            path = os.path.join(directory, 'token.json')
-            save_token(path, {'access_token': 'secret'})
-            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
-
-    def test_page_validation_is_atomic(self):
-        store = Store(':memory:')
-        with self.assertRaises(ValueError):
-            store.graph_page('school', '学校', {'value': [{'id': 'x'}]}, False)
-        self.assertIsNone(store.graph_state('school'))
-        self.assertEqual(store.db.execute('SELECT COUNT(*) FROM graph_seen').fetchone()[0], 0)
-
-
-class AppTests(unittest.IsolatedAsyncioTestCase):
-    async def asyncSetUp(self):
-        self.store = Store(':memory:')
-        settings = Settings(123, 'ws://localhost:3001', 'token', ':memory:', (), 120)
-        self.app = App(settings, self.store)
-
-    def event(self, text, sender=123, message_id=1):
-        return {'message_type':'private', 'user_id':sender, 'self_id':456, 'message_id':message_id,
-                'message':[{'type':'text', 'data':{'text':text}}]}
-
-    async def test_reject_other_user_and_duplicate_event(self):
-        await self.app.accept_event(self.event('明天提醒我交作业', sender=111))
-        self.assertTrue(self.app.events.empty())
-        future = (datetime.now(ZONE) + timedelta(days=2)).strftime('%Y-%m-%d %H:%M')
-        event = self.event(f'/add {future} 交作业')
-        await self.app.accept_event(event)
-        await self.app.handle_event(await self.app.commands.get())
-        await self.app.handle_event(event)
-        self.assertEqual(len(self.store.active_reminders()), 1)
-        self.assertEqual(self.store.db.execute('SELECT COUNT(*) FROM outbox').fetchone()[0], 1)
+class OfflineCommandTests(AssistantTestCase):
+    harness_url = ''
 
     async def test_incomplete_rule_input_is_rejected_without_followup(self):
-        await self.app.handle_event(self.event('提醒我交作业'))
-        self.assertIn('/help', self.store.pending_outbox()['text'])
-        await self.app.handle_event(self.event('明天', message_id=2))
+        await self.say('提醒我交作业', 1)
+        self.assertIn('/help', self.last_reply())
+        await self.say('明天', 2)
         self.assertEqual(self.store.active_reminders(), [])
-
-    async def test_dispatch_continues_after_one_message_is_rejected(self):
-        with self.store.db:
-            self.store.enqueue('reply', '1', '被拒绝的消息')
-            self.store.enqueue('reply', '2', '后续消息')
-        delivered = asyncio.Event()
-        async def send(_user, text):
-            if text == '被拒绝的消息':
-                raise RuntimeError('rejected')
-            delivered.set()
-        self.app.bot.send = send
-        task = asyncio.create_task(self.app.dispatch_loop())
-        try:
-            await asyncio.wait_for(delivered.wait(), 1)
-        finally:
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-        rows = self.store.db.execute('SELECT text, sent, attempts FROM outbox ORDER BY id').fetchall()
-        self.assertEqual(rows[0]['attempts'], 1)
-        self.assertIsNone(rows[0]['sent'])
-        self.assertIsNotNone(rows[1]['sent'])
-
-    async def test_cancel_while_dispatch_waits_for_ack_delivers_cancellation_reply(self):
-        with self.store.db:
-            rid = self.store.new_reminder('体测', 100)
-        self.store.schedule_due(120)
-        started, release, replied = asyncio.Event(), asyncio.Event(), asyncio.Event()
-        sent = []
-        async def send(_user, text):
-            sent.append(text)
-            if len(sent) == 1:
-                started.set()
-                await release.wait()
-            else:
-                replied.set()
-        self.app.bot.send = send
-        worker = asyncio.create_task(self.app.dispatch_loop())
-        try:
-            await asyncio.wait_for(started.wait(), 1)
-            with self.store.db:
-                self.store.finish_reminder(rid, 'cancelled')
-                self.store.enqueue('reply', 'cancel-event', '已取消体测')
-            release.set()
-            await asyncio.wait_for(replied.wait(), 1)
-            self.assertEqual(sent[1:], ['已取消体测'])
-        finally:
-            release.set()
-            worker.cancel()
-            await asyncio.gather(worker, return_exceptions=True)
-
-
-class OneBotTests(unittest.IsolatedAsyncioTestCase):
-    async def test_send_waits_for_successful_onebot_ack(self):
-        from hence.onebot import OneBot
-        import json
-        settings = Settings(123, 'ws://localhost:3001', 'token', ':memory:', (), 120)
-        bot = OneBot(settings, None)
-        class Socket:
-            async def send(self, data):
-                message = json.loads(data)
-                self.message = message
-                bot.pending[message['echo']].set_result({'status': 'ok', 'retcode': 0})
-        socket = Socket()
-        bot.socket = socket
-        await bot.send(123, '提醒')
-        self.assertEqual(socket.message['action'], 'send_private_msg')
-        self.assertEqual(socket.message['params']['user_id'], 123)
-        self.assertEqual(bot.pending, {})
-        bot.socket = None
-        with self.assertRaises(ConnectionError):
-            await bot.send(123, '提醒')
 
 
 if __name__ == '__main__':

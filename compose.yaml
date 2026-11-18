@@ -1,26 +1,41 @@
 services:
-  napcat:
-    image: mlikiowa/napcat-docker:latest
-    restart: unless-stopped
-    environment:
-      MODE: ws
-      WEBUI_TOKEN: ${NAPCAT_WEBUI_TOKEN:?Set NAPCAT_WEBUI_TOKEN in .env}
-    ports:
-      - "127.0.0.1:6099:6099"
-    volumes:
-      - ./data/qq:/app/.config/QQ
-      - ./data/napcat-config:/app/napcat/config
-      - ./data/napcat-plugins:/app/napcat/plugins
   assistant:
     build: .
+    image: hence-agent-assistant:plugin
     restart: unless-stopped
     env_file: .env
     environment:
-      ONEBOT_URL: ws://napcat:3001
       DB_PATH: /data/assistant.sqlite3
       MAIL_CONFIG: /config/mailboxes.json
+      QQ_BRIDGE_URL: http://harness:8081
+      HARNESS_URL: http://harness:8080/turn
+      HARNESS_AUTH_TOKEN: ${HARNESS_AUTH_TOKEN:?Set HARNESS_AUTH_TOKEN in .env}
     volumes:
       - ./data/assistant:/data
       - ./config:/config:ro
-    depends_on:
-      - napcat
+  harness:
+    build:
+      context: .
+      dockerfile: Dockerfile.harness
+    image: hence-agent-harness:plugin
+    restart: unless-stopped
+    environment:
+      DEEPSEEK_API_KEY: ${LLM_API_KEY:?Set LLM_API_KEY in .env}
+      DSH_MODEL: ${LLM_MODEL:-deepseek-flash}
+      QQBOT_APPID: ${QQ_BOT_APP_ID:-}
+      QQBOT_SECRET: ${QQ_BOT_APP_SECRET:-}
+      QQ_BOT_OWNER_OPENID: ${QQ_BOT_OWNER_OPENID:-}
+      TMPDIR: /data
+      HOME: /data
+      XDG_CACHE_HOME: /data/.cache
+      NARB_NATIVE_CACHE_DIR: /data/native-cache
+      HARNESS_AUTH_TOKEN: ${HARNESS_AUTH_TOKEN:?Set HARNESS_AUTH_TOKEN in .env}
+    volumes:
+      - ./data/harness:/data
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true

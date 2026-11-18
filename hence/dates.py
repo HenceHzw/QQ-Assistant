@@ -4,6 +4,8 @@ from datetime import date, datetime, time, timedelta
 
 from .reminders import ZONE
 
+DEFAULT_ALERTS = [{'days': 2, 'time': '09:00'}, {'days': 0, 'time': '09:00'}]
+
 
 def validate_date_reminder(title, day, show_days, alerts, now):
     if not isinstance(title, str) or not title.strip() or len(title.strip()) > 300:

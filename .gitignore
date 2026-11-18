@@ -17,3 +17,5 @@ __pycache__/
 *.tar.gz
 *.tgz
 *.zip
+.npm/
+node_modules/

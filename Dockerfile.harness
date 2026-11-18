@@ -1,7 +1,15 @@
+FROM node:24-bookworm-slim AS plugins
+WORKDIR /plugins
+COPY harness_runtime/qq_plugin/package*.json ./
+RUN npm ci --omit=dev --ignore-scripts --legacy-peer-deps --no-audit --no-fund
+
 FROM python:3.12-slim
 WORKDIR /app
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
 RUN pip install --no-cache-dir 'deepseek-harness-sdk==0.2.2rc2' && useradd --create-home --uid 10001 assistant
 COPY harness_runtime/server.py harness_runtime/profile.yml ./
+COPY harness_runtime/qq_plugin ./qq_plugin
+COPY --from=plugins /plugins/node_modules ./qq_plugin/node_modules
+RUN python qq_plugin/patch.py
 USER assistant
 CMD ["python", "server.py"]

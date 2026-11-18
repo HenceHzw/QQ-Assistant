@@ -1,6 +1,6 @@
 # QQ Assistant
 
-通过 QQ 管理待办、接收邮件提醒的自托管个人助手。使用 DeepSeek Harness 对话，支持多个邮箱；固定指令可在模型不可用时使用。
+通过 QQ 官方机器人管理待办、接收邮件提醒的自托管个人助手。使用腾讯官方 Harness 插件连接 QQ，支持多个邮箱和持续对话；固定指令可在模型不可用时使用。
 
 [快速开始](#快速开始) · [使用方式](#使用方式) · [工作原理](#工作原理) · [部署与故障排查](docs/harness-deployment.md)
 
@@ -10,7 +10,7 @@
 
 ## 能做什么
 
-- **邮件通知**：通过 IMAP 或 Microsoft Graph 检查多个收件箱，在 QQ 提醒新邮件的发件人和主题。
+- **邮件通知**：通过 IMAP 检查多个收件箱，在 QQ 提醒新邮件的发件人和主题。
 - **待办提醒**：用自然语言创建、查看和管理单次提醒；到期后通过 QQ 发送通知。
 - **日期提醒**：为体测、截止日期等事项设置提前提醒，只在临近时显示在待办列表。
 - **日常对话**：通过 DeepSeek Harness 进行对话，重启后恢复会话；长对话会压缩，旧信息可能被遗漏。
@@ -18,7 +18,7 @@
 
 ## 使用方式
 
-在个人 QQ 与助手 QQ 的私聊中，直接说：
+在 QQ 与你创建的官方机器人的私聊中，直接说：
 
 ```text
 明天上午 9 点提醒我交作业
@@ -38,7 +38,7 @@
 
 自然语言提醒默认使用北京时间；只说日期时默认 09:00。请检查助手回复中的事项和时间；模型不可用时请使用 `/add` 创建提醒。
 
-待办按提醒时间排序，序号可能变化，按序号操作前请先查看 `/list`。也可以直接说“取消体测”，助手会列出相关事项，等你确认后再处理。普通待办提醒过后仍会留在列表中，直到你完成或取消它。
+序号以当前列表为准。按序号操作前请先查看对应页，例如处理第 6 项前发送 `/list 2`。也可以直接说“取消体测”，助手会列出相关事项，等你确认后再处理。普通待办提醒过后仍会留在列表中，直到你完成或取消它。
 
 生日、体测、考试和报名截止日期等会默认记为日期提醒，无需特意说明类型；你指定的提醒方式优先。具体用法见[日期提醒](docs/date-reminders.md)。
 
@@ -46,40 +46,24 @@
 
 ### 准备
 
-- Linux 服务器或本机 Linux 环境，以及 Docker Compose。
-- 一个供 NapCat 登录的助手 QQ 账号和你自己的 QQ 号码。
-- DeepSeek API Key；邮箱服务商提供的 IMAP 地址及客户端专用密码或授权码。
-- 网络可访问 Docker 镜像仓库、PyPI 和 DeepSeek API。服务器和模型调用可能产生费用。
+- Linux 服务器或 WSL 2 环境，已安装 Git、Docker 和 Docker Compose。
+- 在 [QQ 开放平台](https://q.qq.com/qqbot/openclaw/login.html)创建一个官方机器人，取得 AppID 和 AppSecret，并将机器人添加到自己的 QQ。
+- DeepSeek API Key。启用 IMAP 邮箱时，还需要邮箱服务商提供的 IMAP 地址和客户端授权码。
+- 部署环境能够访问 Docker 镜像仓库、npm、PyPI、QQ、DeepSeek API 和所用的邮箱服务。服务器和模型调用可能产生费用。
 
 ### 1. 创建配置
 
-进入项目目录，复制示例文件。`cp -n` 不会覆盖已有配置：
+用 `git clone` 克隆本项目的 GitHub 仓库，进入项目目录后复制示例配置。
 
 ```bash
 cp -n .env.example .env
 cp -n config/mailboxes.example.json config/mailboxes.json
-mkdir -p data/assistant data/harness data/qq data/napcat-config data/napcat-plugins
+mkdir -p data/assistant data/harness
 ```
 
-编辑 `.env`，填写 `OWNER_QQ`、`LLM_API_KEY`、`LLM_MODEL`、邮箱授权码，以及三个不同的随机 Token：`NAPCAT_WEBUI_TOKEN`、`ONEBOT_TOKEN`、`HARNESS_AUTH_TOKEN`。可用 `openssl rand -hex 32` 分别生成 Token。
+编辑 `.env`，填写 `QQ_BOT_APP_ID`、`QQ_BOT_APP_SECRET`、`LLM_API_KEY`、`LLM_MODEL` 和邮箱授权码。用 `openssl rand -hex 32` 生成 `HARNESS_AUTH_TOKEN`；`QQ_BOT_OWNER_OPENID` 暂时留空，下一步绑定后填写。
 
-在 `config/mailboxes.json` 中填写邮箱地址和 IMAP 服务器。`password_env` 是 `.env` 中对应授权码的变量名，**不要把授权码写进 JSON**。示例：
-
-```json
-[
-  {
-    "id": "personal",
-    "name": "个人邮箱",
-    "type": "imap",
-    "host": "imap.example.com",
-    "port": 993,
-    "username": "you@example.com",
-    "password_env": "PERSONAL_MAIL_AUTH_CODE"
-  }
-]
-```
-
-将示例地址替换为邮箱服务商提供的信息，并在 `.env` 中添加 `PERSONAL_MAIL_AUTH_CODE`。多个邮箱在数组中分别添加，每个 `id` 保持唯一且稳定；无需邮箱时可使用 `[]`。Microsoft 365 也可通过 Graph 设备授权接入，具体权限与参数见 `python -m hence.graph_auth --help`；可用性取决于邮箱服务商的策略。
+使用 QQ 邮箱时，在 `config/mailboxes.json` 的示例中填入真实邮箱地址，在 `.env` 中填写 `QQ_MAIL_AUTH_CODE`。添加其他 IMAP 邮箱时复制一个配置对象，填写独立的 `id`、主机名和用户名，并让 `password_env` 指向对应的环境变量。只使用待办功能时，邮箱配置可写为 `[]`。
 
 编辑完成后，设置容器访问所需的文件权限：
 
@@ -89,75 +73,64 @@ sudo chmod 700 data/assistant data/harness
 sudo chmod 600 .env config/mailboxes.json
 ```
 
-### 2. 启动服务
+### 2. 绑定自己的 QQ
+
+先构建镜像并启动插件，再运行本人绑定程序；程序会自动等待 QQ 连接就绪：
 
 ```bash
-docker compose -f compose.yaml -f compose.harness.yaml up -d --build
-docker compose -f compose.yaml -f compose.harness.yaml ps
+docker compose build
+docker compose up -d harness
+docker compose \
+  run --rm --no-deps assistant python -m hence.qqbot --bind
 ```
 
-如果服务器无法拉取镜像，参见[部署说明](docs/harness-deployment.md)。
+终端会显示一条 `/bind 随机码`。在 5 分钟内用你自己的 QQ 私聊机器人发送这条消息，再把终端返回的 `QQ_BOT_OWNER_OPENID=...` 写入 `.env`。**OpenID 不是 QQ 号码**，它只对应当前机器人；只有持有随机码的账号才能完成这次校验。
 
-### 3. 登录 QQ 并验证
-
-NapCat WebUI 只监听服务器本地地址。远程部署时，在自己的电脑建立 SSH 隧道：
+### 3. 启动并验证
 
 ```bash
-ssh -L 6099:127.0.0.1:6099 your-user@your-server
+docker compose up -d --force-recreate
+docker compose ps
 ```
 
-将 `your-user` 和 `your-server` 换成服务器登录用户名和地址。保持隧道打开，在浏览器访问 `http://127.0.0.1:6099/webui`，使用 `NAPCAT_WEBUI_TOKEN` 登录并扫码登录助手 QQ。在 WebUI 启用 OneBot **正向 WebSocket 服务端**，监听容器内 `0.0.0.0:3001`，Token 与 `.env` 中的 `ONEBOT_TOKEN` 一致。
+在 QQ 中允许机器人主动发送消息，以便接收定时提醒。
 
-向助手 QQ 发送 `/help`。首次配置邮箱时，请等待收件箱初次同步完成后再发送测试邮件：首次同步只建立基准，不会通知已有邮件；默认每 120 秒检查一次。IMAP 邮箱初始化成功后，助手日志会显示 `Mailbox 邮箱ID initialized`，可用以下命令查看：
+向机器人发送 `/help`，再测试一条即将到期的提醒。首次配置邮箱时，请等待收件箱初次同步完成后再发送测试邮件：首次同步只建立基准，不会通知已有邮件；默认每 120 秒检查一次。IMAP 邮箱初始化成功后，助手日志会显示 `Mailbox 邮箱ID initialized`，可用以下命令查看：
 
 ```bash
-docker compose -f compose.yaml -f compose.harness.yaml logs --tail=50 assistant
+docker compose logs --tail=50 assistant
 ```
 
-Microsoft Graph 邮箱不使用这条 IMAP 初始化日志；如同步异常，请参考[故障排查](docs/harness-deployment.md#检查状态)。
+如未收到邮件通知，请参考[故障排查](docs/harness-deployment.md#检查状态)。
 
 ## 工作原理
 
 ```text
-个人 QQ ←→ NapCat / OneBot ←→ 助手 ←→ DeepSeek Harness
-                                  ├── IMAP / Microsoft Graph
-                                  └── SQLite（待办、同步进度、待发送消息）
+个人 QQ ←→ 腾讯官方插件 ←→ 助手 ←→ Harness 对话
+                            ├── IMAP 邮箱
+                            └── SQLite（待办、同步进度、消息队列）
 ```
 
-助手只处理 `OWNER_QQ` 指定账号的私聊文字。普通消息交给模型理解，待办操作由助手校验执行；固定指令直接由助手处理。邮箱通过 IMAP 或 Graph 接入，并不读取 Outlook 软件本身。
+助手只处理 `QQ_BOT_OWNER_OPENID` 指定账号的私聊文字，不处理群消息或附件。普通消息交给模型理解，待办操作由助手校验执行；固定指令直接由助手处理。
 
-邮箱流程不会将邮件正文发送给模型；私聊文本、对话上下文、最多 30 条当前待办及 30 条未完成日期提醒快照会发送给模型服务。模型不能直接访问邮箱、文件系统或执行命令。
+模型接收聊天与待办上下文，邮箱检查独立运行。数据保存位置及模型可访问的内容见[数据与权限](docs/harness-deployment.md#数据与权限)。
 
-## 运维与数据
+## 运维
 
-```bash
-# 查看状态和日志
-docker compose -f compose.yaml -f compose.harness.yaml ps
-docker compose -f compose.yaml -f compose.harness.yaml logs --tail=50 assistant harness
-
-# 运行测试
-python3 -m unittest discover -s tests -v
-```
-
-- `.env` 保存 API Key、授权码和 Token；`config/mailboxes.json` 包含邮箱地址。它们不应提交到公开仓库。
-- `data/assistant` 保存待办和邮箱进度，`data/harness` 保存会话，`data/qq` 和 `data/napcat-*` 保存 QQ 登录或配置数据。备份时应保护这些文件。
-- QQ 下线可能需要重新验证；邮箱连续检查失败三次及恢复时会通过 QQ 通知。发送失败会重试，极端情况下可能重复通知。
-
-更多操作和故障排查见[部署说明](docs/harness-deployment.md)。
+在项目目录执行 `docker compose ps` 查看运行状态，执行 `docker compose logs --tail=50 assistant harness` 检查日志。[备份与更新](docs/harness-deployment.md#备份与更新) · [插件与测试](docs/harness-deployment.md#插件与测试)
 
 ## 项目结构
 
 ```text
 hence/                         助手逻辑：QQ、邮箱、待办和存储
-harness_runtime/               DeepSeek Harness 服务与配置
+harness_runtime/               Harness 服务、官方插件依赖与适配层
 config/mailboxes.example.json  邮箱配置模板
 docs/                          部署与故障排查
 tests/                         自动化测试
-compose.yaml                   助手与 NapCat
-compose.harness.yaml           Harness 服务配置
+compose.yaml                   助手与 Harness 插件服务配置
 Dockerfile*                    镜像构建文件
 ```
 
 ## 许可
 
-项目自身代码使用 [MIT License](LICENSE)。NapCat、DeepSeek 和其他依赖有各自的条款，详见 [第三方组件说明](THIRD-PARTY-NOTICES.md)。
+项目自身代码使用 [MIT License](LICENSE)。QQ 开放平台、DeepSeek 和其他依赖有各自的条款，详见 [第三方组件说明](THIRD-PARTY-NOTICES.md)。

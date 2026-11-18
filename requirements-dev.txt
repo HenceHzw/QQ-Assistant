@@ -1,0 +1,3 @@
+-r requirements.txt
+websockets>=14,<16
+deepseek-harness-sdk==0.2.2rc2

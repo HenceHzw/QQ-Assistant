@@ -1,0 +1,20 @@
+{
+  "name": "qq-assistant-plugin-bridge",
+  "private": true,
+  "type": "module",
+  "version": "1.0.0",
+  "dependencies": {
+    "@tencent-connect/dsh-qqbot": "0.5.5",
+    "@tencent-connect/qqbot-nodejs": "1.0.5",
+    "@deepseek-ai/cordis": "4.1.0",
+    "@deepseek-ai/schemastery": "3.19.0",
+    "@deepseek-ai/dsh-llm": "0.2.2-rc.2",
+    "@deepseek-ai/dsh-agent": "0.2.2-rc.2",
+    "@deepseek-ai/dsh-session": "0.2.2-rc.2",
+    "@deepseek-ai/dsh-user-approval": "0.2.2-rc.2",
+    "@deepseek-ai/dsh-scope": "0.2.2-rc.2",
+    "@deepseek-ai/dsh-session-projection": "0.2.2-rc.2",
+    "@deepseek-ai/dsh-system-prompt": "0.2.2-rc.2",
+    "@deepseek-ai/dsh-error": "0.2.2-rc.2"
+  }
+}
